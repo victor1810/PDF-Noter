@@ -10,7 +10,17 @@ except ImportError:  # pragma: no cover - older releases
     import fitz
 
 from PySide6.QtCore import QSettings, Qt
-from PySide6.QtGui import QAction, QActionGroup, QColor, QIcon, QKeySequence, QPixmap
+from PySide6.QtGui import (
+    QAction,
+    QActionGroup,
+    QColor,
+    QIcon,
+    QKeySequence,
+    QPainter,
+    QPixmap,
+    QUndoCommand,
+    QUndoStack,
+)
 from PySide6.QtWidgets import (
     QApplication,
     QColorDialog,
@@ -31,6 +41,48 @@ from . import ocr as ocr_module
 from .theme import DARK, LIGHT, SYSTEM, ThemeManager
 from .viewer import PdfViewer, Tool
 
+UNDO_LIMIT = 20
+
+
+def _history_icon(symbol: str, color: str) -> QIcon:
+    """Small toolbar icon drawn locally (no external theme dependency)."""
+    pixmap = QPixmap(24, 24)
+    pixmap.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(pixmap)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+    painter.setPen(QColor(color))
+    painter.drawText(pixmap.rect(), Qt.AlignmentFlag.AlignCenter, symbol)
+    painter.end()
+    return QIcon(pixmap)
+
+
+class DocumentSnapshotCommand(QUndoCommand):
+    """Undo/redo a document edit by restoring whole-PDF snapshots.
+
+    Annotations, page operations and OCR all change the PDF in ways that are
+    awkward to invert individually. Snapshots are simple and reliable; the
+    stack is capped by ``UNDO_LIMIT`` to keep memory usage predictable.
+    """
+
+    def __init__(
+        self, window: "MainWindow", label: str, before: bytes, after: bytes
+    ) -> None:
+        super().__init__(label)
+        self._window = window
+        self._before = before
+        self._after = after
+        self._first_redo = True
+
+    def undo(self) -> None:
+        self._window._restore_snapshot(self._before)
+
+    def redo(self) -> None:
+        # QUndoStack.redo() is called by push(); the change is already applied.
+        if self._first_redo:
+            self._first_redo = False
+            return
+        self._window._restore_snapshot(self._after)
+
 
 class MainWindow(QMainWindow):
     def __init__(self, theme: ThemeManager) -> None:
@@ -44,6 +96,12 @@ class MainWindow(QMainWindow):
             "ocrLanguage", ocr_module.DEFAULT_LANGUAGE, str
         )
         self._updating_page_spin = False
+        self._password = ""
+        self._pending_snapshot: bytes | None = None
+        self._undo_stack = QUndoStack(self)
+        self._undo_stack.setUndoLimit(UNDO_LIMIT)
+        self._undo_stack.setClean()
+        self._undo_stack.cleanChanged.connect(self._on_clean_changed)
 
         self.setWindowTitle("PDF Noter")
         self.resize(1100, 780)
@@ -52,6 +110,12 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(self.viewer)
 
         self._create_actions()
+        self.act_undo.triggered.connect(
+            lambda: self.statusBar().showMessage("Действие отменено", 2000)
+        )
+        self.act_redo.triggered.connect(
+            lambda: self.statusBar().showMessage("Действие повторено", 2000)
+        )
         self._create_menus()
         self._create_toolbar()
         self._create_status_bar()
@@ -60,6 +124,8 @@ class MainWindow(QMainWindow):
         self.viewer.annotationAdded.connect(self._on_modified)
         self.viewer.annotationDeleted.connect(self._on_modified)
         self.viewer.documentChanged.connect(self._on_modified)
+        self.viewer.operationStarted.connect(self._on_operation_started)
+        self.viewer.operationFinished.connect(self._on_operation_finished)
         self.viewer.pageChanged.connect(self._on_page_changed)
         self.viewer.zoomChanged.connect(self._on_zoom_changed)
         self.viewer.statusMessage.connect(self.statusBar().showMessage)
@@ -91,6 +157,14 @@ class MainWindow(QMainWindow):
         self.act_open = self._action("Открыть...", self.open_dialog, "Ctrl+O")
         self.act_save = self._action("Сохранить", self.save, "Ctrl+S")
         self.act_save_as = self._action("Сохранить как...", self.save_as, "Ctrl+Shift+S")
+        self.act_undo = self._undo_stack.createUndoAction(self, "Отменить")
+        self.act_undo.setShortcut(QKeySequence.Undo)
+        self.act_undo.setIcon(_history_icon("↶", "#69b7ff"))
+        self.act_redo = self._undo_stack.createRedoAction(self, "Повторить")
+        self.act_redo.setShortcuts(
+            [QKeySequence("Ctrl+Y"), QKeySequence("Ctrl+Shift+Z")]
+        )
+        self.act_redo.setIcon(_history_icon("↷", "#ffb26b"))
         self.act_close = self._action("Закрыть файл", self.close_document, "Ctrl+W")
         self.act_quit = self._action("Выход", self.close, "Alt+F4")
 
@@ -166,6 +240,12 @@ class MainWindow(QMainWindow):
         file_menu.addSeparator()
         file_menu.addAction(self.act_quit)
 
+        edit_menu = self.menuBar().addMenu("Правка")
+        edit_menu.addAction(self.act_undo)
+        edit_menu.addAction(self.act_redo)
+        edit_menu.addSeparator()
+        edit_menu.addAction(self.act_delete)
+
         view_menu = self.menuBar().addMenu("Вид")
         view_menu.addAction(self.act_zoom_in)
         view_menu.addAction(self.act_zoom_out)
@@ -207,6 +287,9 @@ class MainWindow(QMainWindow):
 
         toolbar.addAction(self.act_open)
         toolbar.addAction(self.act_save)
+        toolbar.addSeparator()
+        toolbar.addAction(self.act_undo)
+        toolbar.addAction(self.act_redo)
         toolbar.addSeparator()
         for tool, action in self._tool_actions.items():
             action.setText(self._tool_label(tool))
@@ -270,6 +353,7 @@ class MainWindow(QMainWindow):
     def open_pdf(self, path: str) -> bool:
         if not self._confirm_discard():
             return False
+        self._password = ""
         try:
             doc = fitz.open(path)
             if doc.needs_pass:
@@ -283,6 +367,7 @@ class MainWindow(QMainWindow):
                     doc.close()
                     QMessageBox.warning(self, "Ошибка", "Неверный пароль или файл не удалось открыть.")
                     return False
+                self._password = password
             if len(doc) == 0:
                 try:
                     doc.repair()
@@ -311,9 +396,10 @@ class MainWindow(QMainWindow):
             self._doc.close()
         self._doc = doc
         self._path = path
-        self._modified = False
+        self._pending_snapshot = None
+        self._undo_stack.clear()
+        self._mark_clean()
         self._settings.setValue("lastDir", str(Path(path).parent))
-        self._update_title()
         self._update_actions()
         self._file_label.setText(Path(path).name)
         return True
@@ -325,6 +411,9 @@ class MainWindow(QMainWindow):
             self._doc.close()
         self._doc = None
         self._path = None
+        self._password = ""
+        self._pending_snapshot = None
+        self._undo_stack.clear()
         self._modified = False
         self.viewer.close_document()
         self._update_title()
@@ -369,6 +458,7 @@ class MainWindow(QMainWindow):
         return True
 
     def _mark_clean(self) -> None:
+        self._undo_stack.setClean()
         self._modified = False
         self._update_title()
 
@@ -401,6 +491,48 @@ class MainWindow(QMainWindow):
     def _on_modified(self, *_args) -> None:
         self._modified = True
         self._update_title()
+
+    def _on_clean_changed(self, clean: bool) -> None:
+        self._modified = not clean
+        self._update_title()
+
+    def _on_operation_started(self, label: str) -> None:
+        if self._doc is None:
+            self._pending_snapshot = None
+            return
+        try:
+            self._pending_snapshot = self._doc.tobytes()
+        except Exception:
+            self._pending_snapshot = None
+
+    def _on_operation_finished(self, label: str) -> None:
+        before = self._pending_snapshot
+        self._pending_snapshot = None
+        if before is None or self._doc is None:
+            return
+        try:
+            after = self._doc.tobytes()
+        except Exception:
+            return
+        if before == after:
+            return
+        self._undo_stack.push(DocumentSnapshotCommand(self, label, before, after))
+
+    def _restore_snapshot(self, data: bytes) -> None:
+        old = self._doc
+        try:
+            doc = fitz.open(stream=data, filetype="pdf")
+            if doc.needs_pass and self._password:
+                doc.authenticate(self._password)
+        except Exception as exc:
+            QMessageBox.warning(self, "Отмена", f"Не удалось восстановить документ:\n{exc}")
+            return
+        self._pending_snapshot = None
+        self.viewer.replace_document(doc)
+        self._doc = doc
+        if old is not None:
+            old.close()
+        self._update_actions()
 
     def _on_page_changed(self, index: int, count: int) -> None:
         self._updating_page_spin = True
@@ -551,8 +683,8 @@ class MainWindow(QMainWindow):
             "<b>PDF Noter</b> — свободный просмотрщик PDF с аннотациями.<br><br>"
             "Возможности: непрерывная прокрутка страниц, масштабирование, "
             "выделение текста, заметки, текстовые поля, карандаш, удаление "
-            "аннотаций, добавление/удаление страниц, OCR через Tesseract, "
-            "сохранение в PDF.<br><br>"
+            "аннотаций, отмена/повтор действий, добавление/удаление страниц, "
+            "OCR через Tesseract, сохранение в PDF.<br><br>"
             "Основан на PySide6 (LGPL v3), PyMuPDF (AGPL v3) и Tesseract OCR (Apache 2.0).<br>"
             "Исходный код распространяется по лицензии AGPL-3.0-or-later.<br><br>"
             "Это независимая разработка, не связанная с PDF-XChange.",

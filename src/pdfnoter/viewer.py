@@ -66,6 +66,8 @@ class PdfViewer(QGraphicsView):
     zoomChanged = Signal(float)
     statusMessage = Signal(str)
     modifiedChanged = Signal(bool)
+    operationStarted = Signal(str)
+    operationFinished = Signal(str)
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -136,6 +138,17 @@ class PdfViewer(QGraphicsView):
         self._ink_path_item.hide()
         self._selection_item.hide()
         self._emit_page()
+
+    def replace_document(self, doc: fitz.Document) -> None:
+        """Swap in a new document object (used by undo/redo snapshots).
+
+        The old object is deliberately *not* closed here: the caller owns it
+        and must close it after this widget stops referencing it.
+        """
+        self._selected = None
+        self._selection_item.hide()
+        self._doc = doc
+        self.refresh()
 
     def _clear_page_items(self) -> None:
         for item in self._page_items:
@@ -349,11 +362,16 @@ class PdfViewer(QGraphicsView):
         width = reference.rect.width if reference is not None else 595.0
         height = reference.rect.height if reference is not None else 842.0
         index = min(len(self._doc), self._current_page + 1) if after_current else len(self._doc)
-        self._doc.new_page(pno=index, width=width, height=height)
-        self._current_page = index
-        self.refresh()
-        self.documentChanged.emit()
-        self.statusMessage.emit(f"Добавлена страница {index + 1}")
+        label = "Вставка страницы" if after_current else "Добавление страницы"
+        self.operationStarted.emit(label)
+        try:
+            self._doc.new_page(pno=index, width=width, height=height)
+            self._current_page = index
+            self.refresh()
+            self.documentChanged.emit()
+            self.statusMessage.emit(f"Добавлена страница {index + 1}")
+        finally:
+            self.operationFinished.emit(label)
         return index
 
     def delete_current_page(self) -> bool:
@@ -361,11 +379,16 @@ class PdfViewer(QGraphicsView):
             self.statusMessage.emit("В документе должна остаться хотя бы одна страница")
             return False
         index = self._current_page
-        self._doc.delete_page(index)
-        self._current_page = max(0, min(index, len(self._doc) - 1))
-        self.refresh()
-        self.documentChanged.emit()
-        self.statusMessage.emit("Страница удалена")
+        label = "Удаление страницы"
+        self.operationStarted.emit(label)
+        try:
+            self._doc.delete_page(index)
+            self._current_page = max(0, min(index, len(self._doc) - 1))
+            self.refresh()
+            self.documentChanged.emit()
+            self.statusMessage.emit("Страница удалена")
+        finally:
+            self.operationFinished.emit(label)
         return True
 
     # -- OCR ----------------------------------------------------------------
@@ -383,20 +406,25 @@ class PdfViewer(QGraphicsView):
         indices = list(range(len(self._doc))) if all_pages else [self._current_page]
         pages_done = 0
         words_done = 0
-        for done, idx in enumerate(indices, start=1):
-            if cancelled is not None and cancelled():
-                break
-            page = self._doc.load_page(idx)
-            count = ocr_module.ocr_page(page, language=language, force=force)
-            if count:
-                pages_done += 1
-                words_done += count
-                self._rendered.discard(idx)
-            if progress is not None:
-                progress(done, len(indices))
-        if pages_done:
-            self.refresh()
-            self.documentChanged.emit()
+        label = "OCR"
+        self.operationStarted.emit(label)
+        try:
+            for done, idx in enumerate(indices, start=1):
+                if cancelled is not None and cancelled():
+                    break
+                page = self._doc.load_page(idx)
+                count = ocr_module.ocr_page(page, language=language, force=force)
+                if count:
+                    pages_done += 1
+                    words_done += count
+                    self._rendered.discard(idx)
+                if progress is not None:
+                    progress(done, len(indices))
+            if pages_done:
+                self.refresh()
+                self.documentChanged.emit()
+        finally:
+            self.operationFinished.emit(label)
         return pages_done, words_done
 
     # -- tools --------------------------------------------------------------
@@ -429,16 +457,21 @@ class PdfViewer(QGraphicsView):
             self.statusMessage.emit("Аннотация не выбрана")
             return
         idx, page, annot = self._selected
+        label = "Удаление аннотации"
+        self.operationStarted.emit(label)
         try:
-            ann.delete_annotation(page, annot)
-        except Exception as exc:  # pragma: no cover - PDF internals
-            QMessageBox.warning(self, "Ошибка", f"Не удалось удалить аннотацию:\n{exc}")
-            return
-        self._selected = None
-        self._selection_item.hide()
-        self._rendered.discard(idx)
-        self.refresh()
-        self.annotationDeleted.emit()
+            try:
+                ann.delete_annotation(page, annot)
+            except Exception as exc:  # pragma: no cover - PDF internals
+                QMessageBox.warning(self, "Ошибка", f"Не удалось удалить аннотацию:\n{exc}")
+                return
+            self._selected = None
+            self._selection_item.hide()
+            self._rendered.discard(idx)
+            self.refresh()
+            self.annotationDeleted.emit()
+        finally:
+            self.operationFinished.emit(label)
 
     # -- mouse handling -----------------------------------------------------
     def mousePressEvent(self, event) -> None:  # noqa: N802 - Qt API
@@ -504,40 +537,47 @@ class PdfViewer(QGraphicsView):
         current_pdf = self._to_pdf(current_scene, idx)
         page = self._doc.load_page(idx)
         annot_obj = None
+        label = None if self._tool is Tool.SELECT else f"Аннотация: {self._tool.value}"
 
+        if label is not None:
+            self.operationStarted.emit(label)
         try:
-            if self._tool in MARKUP_TOOLS:
-                rect = ann.rect_between(self._start_pdf, current_pdf)
-                if ann.is_usable_rect(rect):
-                    annot_obj = ann.add_markup(
-                        page, rect, MARKUP_TOOLS[self._tool], self._color
-                    )
-            elif self._tool is Tool.FREETEXT:
-                rect = ann.rect_between(self._start_pdf, current_pdf)
-                if ann.is_usable_rect(rect):
+            try:
+                if self._tool in MARKUP_TOOLS:
+                    rect = ann.rect_between(self._start_pdf, current_pdf)
+                    if ann.is_usable_rect(rect):
+                        annot_obj = ann.add_markup(
+                            page, rect, MARKUP_TOOLS[self._tool], self._color
+                        )
+                elif self._tool is Tool.FREETEXT:
+                    rect = ann.rect_between(self._start_pdf, current_pdf)
+                    if ann.is_usable_rect(rect):
+                        text, ok = QInputDialog.getMultiLineText(
+                            self, "Текстовое поле", "Введите текст:"
+                        )
+                        if ok and text.strip():
+                            annot_obj = ann.add_freetext(page, rect, text.strip())
+                elif self._tool is Tool.NOTE:
                     text, ok = QInputDialog.getMultiLineText(
-                        self, "Текстовое поле", "Введите текст:"
+                        self, "Заметка", "Введите текст заметки:"
                     )
-                    if ok and text.strip():
-                        annot_obj = ann.add_freetext(page, rect, text.strip())
-            elif self._tool is Tool.NOTE:
-                text, ok = QInputDialog.getMultiLineText(
-                    self, "Заметка", "Введите текст заметки:"
-                )
-                if ok:
-                    annot_obj = ann.add_note(page, current_pdf, text.strip(), self._color)
-            elif self._tool is Tool.INK and len(self._ink_points) >= 2:
-                annot_obj = ann.add_ink(page, self._ink_points, self._color)
-        except Exception as exc:
-            QMessageBox.warning(self, "Ошибка", f"Не удалось добавить аннотацию:\n{exc}")
-        finally:
-            self._clear_preview()
+                    if ok:
+                        annot_obj = ann.add_note(page, current_pdf, text.strip(), self._color)
+                elif self._tool is Tool.INK and len(self._ink_points) >= 2:
+                    annot_obj = ann.add_ink(page, self._ink_points, self._color)
+            except Exception as exc:
+                QMessageBox.warning(self, "Ошибка", f"Не удалось добавить аннотацию:\n{exc}")
+            finally:
+                self._clear_preview()
 
-        if annot_obj is not None:
-            self._rendered.discard(idx)
-            self.refresh()
-            self.annotationAdded.emit(annot_obj)
-            self.statusMessage.emit("Аннотация добавлена. Ctrl+S — сохранить.")
+            if annot_obj is not None:
+                self._rendered.discard(idx)
+                self.refresh()
+                self.annotationAdded.emit(annot_obj)
+                self.statusMessage.emit("Аннотация добавлена. Ctrl+S — сохранить.")
+        finally:
+            if label is not None:
+                self.operationFinished.emit(label)
 
     def wheelEvent(self, event) -> None:  # noqa: N802 - Qt API
         if event.modifiers() & Qt.KeyboardModifier.ControlModifier:

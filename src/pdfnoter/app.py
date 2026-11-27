@@ -14,7 +14,7 @@ from .theme import ThemeManager
 def main() -> int:
     QApplication.setOrganizationName("PDFNoter")
     QApplication.setApplicationName("PDF Noter")
-    QApplication.setApplicationVersion("0.2.0")
+    QApplication.setApplicationVersion("0.2.1")
 
     app = QApplication(sys.argv)
     app.setAttribute(Qt.ApplicationAttribute.AA_UseHighDpiPixmaps, True)
