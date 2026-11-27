@@ -1,5 +1,9 @@
 # PDF Noter
 
+[![License: AGPL-3.0](https://img.shields.io/badge/License-AGPL--3.0-blue.svg)](LICENSE)
+
+Репозиторий: <https://github.com/victor1810/PDF-Noter>
+
 Небольшая **свободная** программа для просмотра PDF и работы с аннотациями под Windows 10/11.
 
 Это **не порт и не взломанная копия PDF-XChange Viewer**. В исходной папке лежал только
