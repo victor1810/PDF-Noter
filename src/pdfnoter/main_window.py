@@ -661,10 +661,37 @@ class MainWindow(QMainWindow):
     def import_images_from_scanner(self) -> None:
         if self._doc is None:
             return
+        try:
+            scanners = image_import.list_scanners()
+        except image_import.ImageSourceError as exc:
+            QMessageBox.warning(self, "Сканер", str(exc))
+            return
+        if not scanners:
+            QMessageBox.warning(
+                self,
+                "Сканер",
+                "Сканеры не найдены. Установите драйвер сканирования МФУ "
+                "или добавьте готовые изображения через «Изображения из файлов».",
+            )
+            return
+
+        device_id = scanners[0].get("id")
+        if len(scanners) > 1:
+            labels = [
+                scanner.get("label") or scanner.get("name") or "Сканер"
+                for scanner in scanners
+            ]
+            choice, ok = QInputDialog.getItem(
+                self, "Выбор сканера", "Сканировать с устройства:", labels, 0, False
+            )
+            if not ok:
+                return
+            device_id = scanners[labels.index(choice)].get("id")
+
         output = Path(tempfile.mkdtemp(prefix="pdfnoter_scan_"))
         try:
             try:
-                paths = image_import.scan_via_wia(output)
+                paths = image_import.scan_via_wia(output, device_id=device_id)
             except image_import.ImageSourceCancelled:
                 self.statusBar().showMessage("Сканирование отменено", 3000)
                 return

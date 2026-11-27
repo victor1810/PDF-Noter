@@ -90,11 +90,16 @@ class ImageImportTest(unittest.TestCase):
         os.close(handle)
         self._sample_image().save(path)
 
+        scanners = [{"id": "{TEST}", "label": "HP LaserJet MFP M132fn (NPI211153)"}]
         with patch(
+            "pdfnoter.main_window.image_import.list_scanners", return_value=scanners
+        ), patch(
             "pdfnoter.main_window.image_import.scan_via_wia", return_value=[Path(path)]
-        ):
+        ) as scan:
             window.import_images_from_scanner()
 
+        scan.assert_called_once()
+        self.assertEqual(scan.call_args.kwargs.get("device_id"), "{TEST}")
         self.assertEqual(window.viewer.page_count(), 2)
         self.assertTrue(window._doc.load_page(1).get_images())
         try:
