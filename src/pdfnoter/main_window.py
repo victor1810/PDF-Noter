@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import shutil
+import tempfile
 from pathlib import Path
 
 try:  # PyMuPDF >= 1.24 exposes the canonical module name
@@ -15,6 +17,7 @@ from PySide6.QtGui import (
     QActionGroup,
     QColor,
     QIcon,
+    QImage,
     QKeySequence,
     QPainter,
     QPixmap,
@@ -24,6 +27,7 @@ from PySide6.QtGui import (
 from PySide6.QtWidgets import (
     QApplication,
     QColorDialog,
+    QDialog,
     QFileDialog,
     QInputDialog,
     QLabel,
@@ -37,7 +41,9 @@ from PySide6.QtWidgets import (
 )
 
 from . import annotations as ann
+from . import image_import
 from . import ocr as ocr_module
+from .camera_dialog import CameraDialog
 from .theme import DARK, LIGHT, SYSTEM, ThemeManager
 from .viewer import PdfViewer, Tool
 
@@ -220,6 +226,19 @@ class MainWindow(QMainWindow):
             "Удалить текущую страницу", self.delete_page, "Ctrl+Del"
         )
 
+        self.act_import_images = self._action(
+            "Изображения из файлов...", self.import_images_from_files, "Ctrl+I"
+        )
+        self.act_import_clipboard = self._action(
+            "Изображение из буфера обмена", self.import_image_from_clipboard, "Ctrl+Shift+V"
+        )
+        self.act_import_scan = self._action(
+            "Сканировать через WIA...", self.import_images_from_scanner, "Ctrl+Shift+I"
+        )
+        self.act_import_camera = self._action(
+            "Снимок с камеры...", self.import_image_from_camera, "Ctrl+Shift+C"
+        )
+
         self.act_ocr_page = self._action(
             "Распознать текущую страницу (OCR)", lambda: self.run_ocr(False), "Ctrl+Shift+R"
         )
@@ -259,6 +278,13 @@ class MainWindow(QMainWindow):
         pages_menu.addAction(self.act_insert_page)
         pages_menu.addAction(self.act_append_page)
         pages_menu.addAction(self.act_delete_page)
+
+        images_menu = self.menuBar().addMenu("Изображения")
+        images_menu.addAction(self.act_import_images)
+        images_menu.addAction(self.act_import_clipboard)
+        images_menu.addSeparator()
+        images_menu.addAction(self.act_import_scan)
+        images_menu.addAction(self.act_import_camera)
 
         annot_menu = self.menuBar().addMenu("Аннотации")
         for action in self._tool_actions.values():
@@ -311,6 +337,7 @@ class MainWindow(QMainWindow):
         toolbar.addWidget(self.page_spin)
         toolbar.addAction(self.act_insert_page)
         toolbar.addAction(self.act_delete_page)
+        toolbar.addAction(self.act_import_images)
         toolbar.addSeparator()
         toolbar.addAction(self.act_ocr_page)
 
@@ -559,6 +586,10 @@ class MainWindow(QMainWindow):
             self.act_insert_page,
             self.act_append_page,
             self.act_delete_page,
+            self.act_import_images,
+            self.act_import_clipboard,
+            self.act_import_scan,
+            self.act_import_camera,
             self.act_ocr_page,
             self.act_ocr_all,
             self.act_color,
@@ -590,6 +621,76 @@ class MainWindow(QMainWindow):
         )
         if answer == QMessageBox.StandardButton.Yes:
             self.viewer.delete_current_page()
+
+    # -- images -------------------------------------------------------------
+    def import_images_from_files(self) -> None:
+        if self._doc is None:
+            return
+        start = self._settings.value("lastDir", str(Path.home()), str)
+        paths, _ = QFileDialog.getOpenFileNames(
+            self, "Добавить изображения", start, image_import.IMAGE_FILTER
+        )
+        self.import_image_paths(paths)
+
+    def import_image_paths(self, paths: list[str] | list[Path]) -> None:
+        """Load images from disk and insert them as pages after the current one."""
+        if self._doc is None or not paths:
+            return
+        images: list[QImage] = []
+        for path in paths:
+            if not image_import.is_image_path(path):
+                continue
+            try:
+                images.extend(image_import.read_images(path))
+            except Exception as exc:
+                QMessageBox.warning(self, "Изображение", str(exc))
+        if not images:
+            self.statusBar().showMessage("Изображения не выбраны", 3000)
+            return
+        self.viewer.insert_images(images)
+
+    def import_image_from_clipboard(self) -> None:
+        image = QApplication.clipboard().image()
+        if image.isNull():
+            QMessageBox.information(
+                self, "Буфер обмена", "В буфере обмена нет изображения."
+            )
+            return
+        self.viewer.insert_images([image])
+
+    def import_images_from_scanner(self) -> None:
+        if self._doc is None:
+            return
+        output = Path(tempfile.mkdtemp(prefix="pdfnoter_scan_"))
+        try:
+            try:
+                paths = image_import.scan_via_wia(output)
+            except image_import.ImageSourceCancelled:
+                self.statusBar().showMessage("Сканирование отменено", 3000)
+                return
+            except image_import.ImageSourceError as exc:
+                QMessageBox.warning(
+                    self,
+                    "Сканер",
+                    f"{exc}\n\nЕсли сканера нет, добавьте готовые изображения "
+                    "через «Изображения из файлов».",
+                )
+                return
+            self.import_image_paths(paths)
+        finally:
+            shutil.rmtree(output, ignore_errors=True)
+
+    def import_image_from_camera(self) -> None:
+        if self._doc is None:
+            return
+        dialog = CameraDialog(self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        image = dialog.image()
+        if image is None or image.isNull():
+            QMessageBox.warning(self, "Камера", "Кадр не получен.")
+            return
+        self.viewer.insert_images([image])
 
     # -- OCR ----------------------------------------------------------------
     def run_ocr(self, all_pages: bool) -> None:
@@ -684,6 +785,7 @@ class MainWindow(QMainWindow):
             "Возможности: непрерывная прокрутка страниц, масштабирование, "
             "выделение текста, заметки, текстовые поля, карандаш, удаление "
             "аннотаций, отмена/повтор действий, добавление/удаление страниц, "
+            "импорт изображений (файлы, буфер обмена, сканер WIA, камера), "
             "OCR через Tesseract, сохранение в PDF.<br><br>"
             "Основан на PySide6 (LGPL v3), PyMuPDF (AGPL v3) и Tesseract OCR (Apache 2.0).<br>"
             "Исходный код распространяется по лицензии AGPL-3.0-or-later.<br><br>"
@@ -693,14 +795,18 @@ class MainWindow(QMainWindow):
     # -- drag and drop ------------------------------------------------------
     def dragEnterEvent(self, event) -> None:  # noqa: N802 - Qt API
         if event.mimeData().hasUrls():
-            urls = event.mimeData().urls()
-            if urls and urls[0].toLocalFile().lower().endswith(".pdf"):
-                event.acceptProposedAction()
+            for url in event.mimeData().urls():
+                path = url.toLocalFile().lower()
+                if path.endswith(".pdf") or image_import.is_image_path(path):
+                    event.acceptProposedAction()
+                    return
 
     def dropEvent(self, event) -> None:  # noqa: N802 - Qt API
-        urls = event.mimeData().urls()
-        if urls:
-            path = urls[0].toLocalFile()
-            if Path(path).suffix.lower() == ".pdf":
-                self.open_pdf(path)
+        paths = [url.toLocalFile() for url in event.mimeData().urls()]
+        pdfs = [path for path in paths if Path(path).suffix.lower() == ".pdf"]
+        images = [path for path in paths if image_import.is_image_path(path)]
+        if pdfs:
+            self.open_pdf(pdfs[0])
+        if images:
+            self.import_image_paths(images)
         event.acceptProposedAction()

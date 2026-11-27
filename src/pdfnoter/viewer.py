@@ -32,6 +32,7 @@ from PySide6.QtWidgets import (
 )
 
 from . import annotations as ann
+from . import image_import
 from . import ocr as ocr_module
 
 
@@ -373,6 +374,32 @@ class PdfViewer(QGraphicsView):
         finally:
             self.operationFinished.emit(label)
         return index
+
+    def insert_images(
+        self,
+        images: list[QImage],
+        after_current: bool = True,
+        dpi: float | None = None,
+    ) -> list[int]:
+        """Turn Qt images into PDF pages and insert them after the current page."""
+        if self._doc is None or not images:
+            return []
+        index = (
+            min(len(self._doc), self._current_page + 1)
+            if after_current
+            else len(self._doc)
+        )
+        label = "Добавление изображений"
+        self.operationStarted.emit(label)
+        try:
+            count = image_import.insert_images(self._doc, images, index, dpi)
+            self._current_page = index
+            self.refresh()
+            self.documentChanged.emit()
+            self.statusMessage.emit(f"Добавлено страниц из изображений: {count}")
+        finally:
+            self.operationFinished.emit(label)
+        return list(range(index, index + count))
 
     def delete_current_page(self) -> bool:
         if self._doc is None or len(self._doc) <= 1:
